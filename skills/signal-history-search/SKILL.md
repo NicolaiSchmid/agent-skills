@@ -10,7 +10,7 @@ metadata:
     - Signal Desktop (logged in)
     - nix-shell
 scripts:
-  search: skills/signal-history-search/scripts/signal-search
+  search: ./scripts/signal-search
 ---
 
 # Signal History Search
@@ -39,6 +39,12 @@ First run caches the Python environment path (~5-10s setup), subsequent runs are
 # List all available chats
 signal-search list
 
+# Dump all messages from a specific day
+signal-search dump --date "2026-01-25"
+
+# Dump a specific day's chat with one person
+signal-search dump --date "2026-01-25" --chat "Dariush"
+
 # Search within a specific chat
 signal-search search --query "istanbul" --chat "Monika"
 
@@ -63,7 +69,15 @@ signal-search search --query "meeting" --max-count 10
 | Command | Description |
 | ------- | ----------- |
 | `list` | List all available chats (name and type) |
+| `dump` | Dump all messages from a specific day |
 | `search` | Search messages |
+
+### Dump Flags
+
+| Flag | Short | Description |
+| ---- | ----- | ----------- |
+| `--date <YYYY-MM-DD>` | `-d` | Date to dump (required) |
+| `--chat <name>` | `-c` | Filter to chats containing this string |
 
 ### Search Flags
 

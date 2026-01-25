@@ -162,6 +162,96 @@ def list_chats(db) -> None:
         print(f"{name} ({chat_type})")
 
 
+def dump_day(
+    db,
+    date_str: str,
+    chat_filter: str = None,
+) -> None:
+    """Dump all messages from a specific day."""
+    contacts, by_service_id = get_contacts(db)
+    
+    # Parse date
+    try:
+        target_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+    except ValueError:
+        print(f"Invalid date format: {date_str}. Use YYYY-MM-DD", file=sys.stderr)
+        return
+    
+    # Calculate timestamp range (start of day to end of day in ms)
+    start_ts = int(datetime(target_date.year, target_date.month, target_date.day, 0, 0, 0).timestamp() * 1000)
+    end_ts = int(datetime(target_date.year, target_date.month, target_date.day, 23, 59, 59, 999999).timestamp() * 1000)
+    
+    # Find matching conversation IDs if chat filter specified
+    target_conv_ids = None
+    if chat_filter:
+        chat_filter_lower = chat_filter.lower()
+        target_conv_ids = [
+            cid for cid, c in contacts.items()
+            if chat_filter_lower in (c["displayName"] or "").lower()
+        ]
+        if not target_conv_ids:
+            print(f"No chats matching '{chat_filter}'", file=sys.stderr)
+            return
+    
+    # Build the query
+    cursor = db.cursor()
+    
+    sql = """
+        SELECT
+            conversationId,
+            body,
+            sent_at,
+            sourceServiceId,
+            type,
+            json
+        FROM messages
+        WHERE body IS NOT NULL AND body != ''
+        AND sent_at >= ? AND sent_at <= ?
+    """
+    
+    params = [start_ts, end_ts]
+    
+    if target_conv_ids:
+        placeholders = ",".join("?" * len(target_conv_ids))
+        sql += f" AND conversationId IN ({placeholders})"
+        params.extend(target_conv_ids)
+    
+    sql += " ORDER BY sent_at ASC"
+    
+    cursor.execute(sql, params)
+    
+    # Print messages
+    msg_count = 0
+    for row in cursor:
+        conv_id, body, sent_at, source_service_id, msg_type, msg_json = row
+        
+        if not body:
+            continue
+        
+        # Parse timestamp
+        ts = datetime.fromtimestamp(sent_at / 1000) if sent_at else None
+        ts_str = ts.strftime("%Y-%m-%d %H:%M:%S") if ts else "unknown"
+        
+        # Get sender name
+        contact = contacts.get(conv_id, {})
+        chat_name = contact.get("displayName", conv_id)
+        
+        if source_service_id and source_service_id in by_service_id:
+            sender = by_service_id[source_service_id].get("displayName", "Unknown")
+        elif msg_type == "outgoing":
+            sender = "Me"
+        else:
+            sender = "Unknown"
+        
+        print(f"[{ts_str}] {chat_name} | {sender}: {body}")
+        msg_count += 1
+    
+    if msg_count == 0:
+        print(f"No messages found for {date_str}", file=sys.stderr)
+    else:
+        print(f"\n-- {msg_count} message(s) from {date_str} --", file=sys.stderr)
+
+
 def search_messages(
     db,
     query: str,
@@ -297,6 +387,18 @@ def main():
     # List command
     list_parser = subparsers.add_parser("list", help="List available chats")
     
+    # Dump command
+    dump_parser = subparsers.add_parser("dump", help="Dump all messages from a specific day")
+    dump_parser.add_argument(
+        "--date", "-d",
+        required=True,
+        help="Date to dump (YYYY-MM-DD format)"
+    )
+    dump_parser.add_argument(
+        "--chat", "-c",
+        help="Filter to chats containing this string"
+    )
+    
     # Search command
     search_parser = subparsers.add_parser("search", help="Search messages")
     search_parser.add_argument(
@@ -355,6 +457,12 @@ def main():
     # Execute command
     if args.command == "list":
         list_chats(db)
+    elif args.command == "dump":
+        dump_day(
+            db,
+            date_str=args.date,
+            chat_filter=args.chat,
+        )
     elif args.command == "search":
         search_messages(
             db,

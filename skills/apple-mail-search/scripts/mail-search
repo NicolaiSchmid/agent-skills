@@ -1,0 +1,494 @@
+#!/usr/bin/env python3
+"""
+mail-search — Search Apple Mail messages via direct SQLite queries.
+
+Fast search against Mail.app's Envelope Index database without launching Mail.
+"""
+
+import argparse
+import os
+import re
+import sqlite3
+import sys
+from datetime import datetime
+from pathlib import Path
+from urllib.parse import unquote
+
+
+def get_mail_dir() -> Path:
+    """Get Apple Mail data directory."""
+    mail_dir = Path.home() / "Library" / "Mail"
+    if not mail_dir.exists():
+        raise FileNotFoundError(f"Apple Mail directory not found at {mail_dir}")
+    
+    # Find the latest version directory (V10, V9, etc.)
+    version_dirs = sorted(
+        [d for d in mail_dir.iterdir() if d.is_dir() and d.name.startswith("V")],
+        key=lambda d: int(d.name[1:]) if d.name[1:].isdigit() else 0,
+        reverse=True
+    )
+    
+    if not version_dirs:
+        raise FileNotFoundError("No Mail version directory found")
+    
+    return version_dirs[0]
+
+
+def get_db_path(mail_dir: Path) -> Path:
+    """Get path to Envelope Index database."""
+    db_path = mail_dir / "MailData" / "Envelope Index"
+    if not db_path.exists():
+        raise FileNotFoundError(f"Envelope Index not found at {db_path}")
+    return db_path
+
+
+def open_db(db_path: Path) -> sqlite3.Connection:
+    """Open database in read-only mode."""
+    # Use URI mode for read-only access
+    uri = f"file:{db_path}?mode=ro"
+    db = sqlite3.connect(uri, uri=True)
+    db.row_factory = sqlite3.Row
+    return db
+
+
+def parse_mailbox_url(url: str) -> dict:
+    """Parse mailbox URL into account and folder components."""
+    # Format: protocol://account-uuid/folder%20name
+    # Examples:
+    #   imap://7F91A6F8-40C7-4CDF-999D-08C5CEC5F627/INBOX
+    #   ews://5D81E89A-982A-4037-8CEB-B0C4C84B60B1/Posteingang
+    
+    match = re.match(r"(\w+)://([^/]+)/(.+)", url)
+    if not match:
+        return {"protocol": "", "account_uuid": "", "folder": url}
+    
+    protocol, account_uuid, folder = match.groups()
+    return {
+        "protocol": protocol,
+        "account_uuid": account_uuid,
+        "folder": unquote(folder)
+    }
+
+
+def get_account_names(mail_dir: Path) -> dict:
+    """Map account UUIDs to friendly names via AppleScript."""
+    import subprocess
+    
+    # Get account names from Mail.app via AppleScript
+    script = 'tell application "Mail" to get {name, id} of every account'
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if result.returncode == 0:
+            # Parse output like: {iCloud, Exchange, Wasc}, {uuid1, uuid2, uuid3}
+            output = result.stdout.strip()
+            # Simple parsing - AppleScript returns nested lists
+            parts = output.split(", ")
+            # This is a simplified parse; real parsing would need proper AppleScript list handling
+            pass
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+    
+    # Fallback: use folder names in Mail directory
+    account_map = {}
+    for item in mail_dir.iterdir():
+        if item.is_dir() and item.name != "MailData":
+            # Check for account info plist
+            info_plist = item / ".mboxCache.plist"
+            account_map[item.name] = item.name  # UUID as placeholder
+    
+    return account_map
+
+
+def list_accounts(db: sqlite3.Connection, mail_dir: Path) -> None:
+    """List all configured mail accounts."""
+    cursor = db.cursor()
+    
+    # Get unique account UUIDs from mailboxes
+    cursor.execute("""
+        SELECT DISTINCT url FROM mailboxes
+        WHERE url LIKE 'imap://%' OR url LIKE 'ews://%' OR url LIKE 'pop://%'
+    """)
+    
+    accounts = {}
+    for row in cursor:
+        parsed = parse_mailbox_url(row["url"])
+        uuid = parsed["account_uuid"]
+        if uuid and uuid not in accounts:
+            accounts[uuid] = parsed["protocol"]
+    
+    # Get friendly names via AppleScript
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", 'tell application "Mail" to get name of every account'],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if result.returncode == 0:
+            names = result.stdout.strip().split(", ")
+            print("Configured accounts:")
+            for name in names:
+                print(f"  - {name}")
+            return
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+    
+    # Fallback: show UUIDs with protocols
+    print("Configured accounts (by UUID):")
+    for uuid, protocol in accounts.items():
+        print(f"  - {uuid} ({protocol})")
+
+
+def list_mailboxes(db: sqlite3.Connection, account: str = None) -> None:
+    """List mailboxes, optionally filtered by account."""
+    cursor = db.cursor()
+    
+    sql = "SELECT url, total_count, unread_count FROM mailboxes ORDER BY url"
+    cursor.execute(sql)
+    
+    print("Mailboxes:")
+    for row in cursor:
+        parsed = parse_mailbox_url(row["url"])
+        
+        # Filter by account if specified
+        if account:
+            # Match against UUID or try to match account name
+            if account.lower() not in parsed["account_uuid"].lower():
+                # Also check folder path for account name hints
+                if account.lower() not in row["url"].lower():
+                    continue
+        
+        folder = parsed["folder"]
+        total = row["total_count"]
+        unread = row["unread_count"]
+        
+        unread_str = f" ({unread} unread)" if unread > 0 else ""
+        print(f"  {folder}: {total} messages{unread_str}")
+
+
+def format_message(row: sqlite3.Row, verbose: bool = False) -> str:
+    """Format a message row for display."""
+    msg_id = row["msg_id"]
+    subject = row["subject"] or "(no subject)"
+    sender_addr = row["sender_addr"] or ""
+    sender_name = row["sender_name"] or ""
+    date_received = row["date_received"]
+    mailbox_url = row["mailbox_url"]
+    
+    # Format date
+    if date_received:
+        dt = datetime.fromtimestamp(date_received)
+        date_str = dt.strftime("%Y-%m-%d %H:%M")
+    else:
+        date_str = "unknown date"
+    
+    # Format sender
+    if sender_name and sender_name != sender_addr:
+        sender = f"{sender_addr} ({sender_name})"
+    else:
+        sender = sender_addr or "unknown"
+    
+    # Format mailbox
+    parsed = parse_mailbox_url(mailbox_url)
+    mailbox = parsed["folder"]
+    
+    lines = [
+        f"[{msg_id}] {date_str} | {sender}",
+        f"        {subject}",
+    ]
+    
+    if verbose:
+        lines.append(f"        Mailbox: {mailbox}")
+    
+    return "\n".join(lines)
+
+
+def search_messages(
+    db: sqlite3.Connection,
+    subject: str = None,
+    sender: str = None,
+    body: str = None,
+    account: str = None,
+    mailbox: str = None,
+    after: str = None,
+    before: str = None,
+    limit: int = 50,
+    unread_only: bool = False,
+    flagged_only: bool = False,
+) -> None:
+    """Search messages by various criteria."""
+    cursor = db.cursor()
+    
+    # Build query - include summaries if body search is requested
+    sql = """
+        SELECT
+            m.ROWID as msg_id,
+            s.subject,
+            a.address as sender_addr,
+            a.comment as sender_name,
+            m.date_received,
+            mb.url as mailbox_url,
+            m.read,
+            m.flagged
+        FROM messages m
+        JOIN subjects s ON m.subject = s.ROWID
+        JOIN addresses a ON m.sender = a.ROWID
+        JOIN mailboxes mb ON m.mailbox = mb.ROWID
+    """
+    
+    if body:
+        sql += " LEFT JOIN summaries su ON m.summary = su.ROWID"
+    
+    sql += " WHERE m.deleted = 0"
+    
+    params = []
+    
+    if subject:
+        sql += " AND s.subject LIKE ?"
+        params.append(f"%{subject}%")
+    
+    if sender:
+        sql += " AND (a.address LIKE ? OR a.comment LIKE ?)"
+        params.append(f"%{sender}%")
+        params.append(f"%{sender}%")
+    
+    if body:
+        sql += " AND su.summary LIKE ?"
+        params.append(f"%{body}%")
+    
+    if account:
+        sql += " AND mb.url LIKE ?"
+        params.append(f"%{account}%")
+    
+    if mailbox:
+        sql += " AND mb.url LIKE ?"
+        params.append(f"%/{mailbox}%")
+    
+    if after:
+        try:
+            after_dt = datetime.strptime(after, "%Y-%m-%d")
+            sql += " AND m.date_received >= ?"
+            params.append(int(after_dt.timestamp()))
+        except ValueError:
+            print(f"Invalid date format: {after}. Use YYYY-MM-DD", file=sys.stderr)
+            return
+    
+    if before:
+        try:
+            before_dt = datetime.strptime(before, "%Y-%m-%d")
+            # End of day
+            before_dt = before_dt.replace(hour=23, minute=59, second=59)
+            sql += " AND m.date_received <= ?"
+            params.append(int(before_dt.timestamp()))
+        except ValueError:
+            print(f"Invalid date format: {before}. Use YYYY-MM-DD", file=sys.stderr)
+            return
+    
+    if unread_only:
+        sql += " AND m.read = 0"
+    
+    if flagged_only:
+        sql += " AND m.flagged = 1"
+    
+    sql += " ORDER BY m.date_received DESC"
+    
+    if limit:
+        sql += f" LIMIT {limit}"
+    
+    cursor.execute(sql, params)
+    
+    count = 0
+    for row in cursor:
+        print(format_message(row, verbose=True))
+        print()
+        count += 1
+    
+    print(f"-- {count} message(s) found --", file=sys.stderr)
+
+
+def recent_messages(
+    db: sqlite3.Connection,
+    account: str = None,
+    mailbox: str = None,
+    limit: int = 20,
+) -> None:
+    """Get most recent messages."""
+    search_messages(db, account=account, mailbox=mailbox, limit=limit)
+
+
+def dump_date(
+    db: sqlite3.Connection,
+    date_str: str,
+    account: str = None,
+) -> None:
+    """Dump all messages from a specific date."""
+    search_messages(db, after=date_str, before=date_str, account=account, limit=None)
+
+
+def read_message(db: sqlite3.Connection, mail_dir: Path, msg_id: int) -> None:
+    """Read full content of a message by ID."""
+    cursor = db.cursor()
+    
+    # Get message info
+    cursor.execute("""
+        SELECT
+            m.ROWID as msg_id,
+            s.subject,
+            a.address as sender_addr,
+            a.comment as sender_name,
+            m.date_received,
+            mb.url as mailbox_url
+        FROM messages m
+        JOIN subjects s ON m.subject = s.ROWID
+        JOIN addresses a ON m.sender = a.ROWID
+        JOIN mailboxes mb ON m.mailbox = mb.ROWID
+        WHERE m.ROWID = ?
+    """, [msg_id])
+    
+    row = cursor.fetchone()
+    if not row:
+        print(f"Message {msg_id} not found", file=sys.stderr)
+        return
+    
+    # Print header
+    print(format_message(row, verbose=True))
+    print("-" * 60)
+    
+    # Find the .emlx file by message ROWID
+    # Apple Mail stores messages as {ROWID}.emlx or {ROWID}.partial.emlx
+    emlx_files = list(mail_dir.rglob(f"*/{msg_id}.emlx"))
+    partial_files = list(mail_dir.rglob(f"*/{msg_id}.partial.emlx"))
+    
+    target_file = None
+    if emlx_files:
+        target_file = emlx_files[0]
+    elif partial_files:
+        target_file = partial_files[0]
+        print("(Partial download - some content may be missing)", file=sys.stderr)
+    
+    if target_file:
+        try:
+            with open(target_file, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+            
+            # emlx format: first line is byte count, then RFC 2822 message, then plist
+            lines = content.split("\n", 1)
+            if len(lines) > 1:
+                # Skip byte count line
+                message_content = lines[1]
+                
+                # Find where the plist starts (end of email)
+                plist_marker = "<?xml version="
+                plist_idx = message_content.find(plist_marker)
+                if plist_idx > 0:
+                    message_content = message_content[:plist_idx]
+                
+                print(message_content.strip())
+        except Exception as e:
+            print(f"Error reading message file: {e}", file=sys.stderr)
+    else:
+        print(f"Message file not found (ID: {msg_id})", file=sys.stderr)
+        print("The message may not be fully downloaded from the server.", file=sys.stderr)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Search Apple Mail messages via SQLite"
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    
+    # Accounts command
+    subparsers.add_parser("accounts", help="List configured mail accounts")
+    
+    # Mailboxes command
+    mb_parser = subparsers.add_parser("mailboxes", help="List mailboxes")
+    mb_parser.add_argument("--account", "-a", help="Filter by account")
+    
+    # Search command
+    search_parser = subparsers.add_parser("search", help="Search messages")
+    search_parser.add_argument("--subject", "-s", help="Search in subject")
+    search_parser.add_argument("--sender", "-f", help="Search in sender")
+    search_parser.add_argument("--body", "-b", help="Search in message body/preview")
+    search_parser.add_argument("--account", "-a", help="Filter by account")
+    search_parser.add_argument("--mailbox", "-m", help="Filter by mailbox")
+    search_parser.add_argument("--after", help="Messages after date (YYYY-MM-DD)")
+    search_parser.add_argument("--before", help="Messages before date (YYYY-MM-DD)")
+    search_parser.add_argument("--limit", "-n", type=int, default=50, help="Max results")
+    search_parser.add_argument("--unread", "-u", action="store_true", help="Unread only")
+    search_parser.add_argument("--flagged", "-F", action="store_true", help="Flagged only")
+    
+    # Recent command
+    recent_parser = subparsers.add_parser("recent", help="Get recent messages")
+    recent_parser.add_argument("--account", "-a", help="Filter by account")
+    recent_parser.add_argument("--mailbox", "-m", help="Filter by mailbox")
+    recent_parser.add_argument("--limit", "-n", type=int, default=20, help="Max results")
+    
+    # Dump command
+    dump_parser = subparsers.add_parser("dump", help="Dump messages from a date")
+    dump_parser.add_argument("--date", "-d", required=True, help="Date (YYYY-MM-DD)")
+    dump_parser.add_argument("--account", "-a", help="Filter by account")
+    
+    # Read command
+    read_parser = subparsers.add_parser("read", help="Read message content")
+    read_parser.add_argument("--id", type=int, required=True, help="Message ID")
+    
+    args = parser.parse_args()
+    
+    # Get paths
+    try:
+        mail_dir = get_mail_dir()
+        db_path = get_db_path(mail_dir)
+    except FileNotFoundError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    
+    # Open database
+    try:
+        db = open_db(db_path)
+    except sqlite3.Error as e:
+        print(f"Database error: {e}", file=sys.stderr)
+        sys.exit(1)
+    
+    # Execute command
+    try:
+        if args.command == "accounts":
+            list_accounts(db, mail_dir)
+        elif args.command == "mailboxes":
+            list_mailboxes(db, account=args.account)
+        elif args.command == "search":
+            search_messages(
+                db,
+                subject=args.subject,
+                sender=args.sender,
+                body=args.body,
+                account=args.account,
+                mailbox=args.mailbox,
+                after=args.after,
+                before=args.before,
+                limit=args.limit,
+                unread_only=args.unread,
+                flagged_only=args.flagged,
+            )
+        elif args.command == "recent":
+            recent_messages(
+                db,
+                account=args.account,
+                mailbox=args.mailbox,
+                limit=args.limit,
+            )
+        elif args.command == "dump":
+            dump_date(db, date_str=args.date, account=args.account)
+        elif args.command == "read":
+            read_message(db, mail_dir, msg_id=args.id)
+    finally:
+        db.close()
+
+
+if __name__ == "__main__":
+    main()

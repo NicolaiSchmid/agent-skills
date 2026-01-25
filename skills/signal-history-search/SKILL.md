@@ -4,12 +4,11 @@ description: Search Signal Desktop message history on macOS without keeping expo
 license: MIT
 metadata:
   author: Nicolai Schmid
-  version: 0.1.0
+  version: 0.2.0
   requires:
     - macOS
     - Signal Desktop (logged in)
     - nix-shell
-    - ripgrep
 scripts:
   search: skills/signal-history-search/scripts/signal-history-search
 ---
@@ -28,9 +27,8 @@ Use `sigexport` from `signal-export` (via nix-shell) to pull a temporary copy of
 
 1. Validates macOS and Signal Desktop presence.
 2. Creates a temp directory (`mktemp -d`).
-3. Runs `nix-shell -I nixpkgs=channel:nixpkgs-unstable --packages signal-export --command "sigexport …"`.
-4. Searches the exported JSON/text files with `rg` using the provided query.
-5. Cleans up the temp directory.
+3. Runs `nix-shell -p signal-export ripgrep --command "sigexport … && rg …"`.
+4. Cleans up the temp directory.
 
 ## Usage
 

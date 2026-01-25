@@ -49,9 +49,9 @@ require_binary() {
   command -v "$1" >/dev/null 2>&1 || fail "Missing required command: $1"
 }
 
-run_sigexport() {
+run_nix() {
   local cmd="$1"
-  nix-shell -I nixpkgs=channel:nixpkgs-unstable --packages signal-export --command "$cmd"
+  nix-shell -p signal-export ripgrep --command "$cmd"
 }
 
 MODE="search"
@@ -152,14 +152,12 @@ done
 require_mac
 require_signal_install
 require_binary nix-shell
-require_binary rg
 
 if [[ "$MODE" == "list" ]]; then
-  OUTPUT=$(run_sigexport "sigexport --list-chats")
   if [[ -n "$FILTER" ]]; then
-    echo "$OUTPUT" | rg --smart-case --color=never -- "$FILTER"
+    run_nix "sigexport --list-chats | rg --smart-case --color=never -- '$FILTER'"
   else
-    echo "$OUTPUT"
+    run_nix "sigexport --list-chats"
   fi
   exit 0
 fi
@@ -181,20 +179,22 @@ mkdir -p "$EXPORT_DIR"
 
 CMD="sigexport"
 if [[ -n "$CHAT" ]]; then
-  printf -v CHAT_ESC '%q' "$CHAT"
+  # Escape spaces with backslashes for the nested shell (sigexport expects this format)
+  CHAT_ESC="${CHAT// /\\ }"
   CMD+=" --chats=$CHAT_ESC"
 fi
-printf -v DEST_ESC '%q' "$EXPORT_DIR"
-CMD+=" $DEST_ESC"
+CMD+=" '$EXPORT_DIR'"
+
+# Build rg options string for nested shell
+RG_OPTS_STR=""
+for opt in "${RG_OPTS[@]}"; do
+  RG_OPTS_STR+=" $opt"
+done
+
+# Escape query for nested shell (single quotes)
+QUERY_ESC="${QUERY//\'/\'\\\'\'}"
+
+FULL_CMD="$CMD && rg$RG_OPTS_STR -- '$QUERY_ESC' '$EXPORT_DIR'"
 
 echo "Exporting Signal data via sigexport…" >&2
-run_sigexport "$CMD" >/dev/null
-
-if [[ ! -d "$EXPORT_DIR" ]]; then
-  fail "Export directory was not created (expected at $EXPORT_DIR)"
-fi
-
-TARGET_GLOB=("$EXPORT_DIR")
-
-echo "Searching for '$QUERY'…" >&2
-rg "${RG_OPTS[@]}" -- "$QUERY" "${TARGET_GLOB[@]}"
+run_nix "$FULL_CMD"

@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+#
+# signal-search — Fast direct SQL search against Signal Desktop's encrypted database.
+#
+# This wrapper script ensures the Python environment is available and caches
+# the path for sub-second execution times.
+#
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/signal-search"
+PYTHON_PATH_CACHE="$CACHE_DIR/python-path"
+PYTHON_SCRIPT="$SCRIPT_DIR/signal-search-fast"
+
+# Ensure cache directory exists
+mkdir -p "$CACHE_DIR"
+
+get_python_path() {
+    # Check if we have a cached path that still exists
+    if [[ -f "$PYTHON_PATH_CACHE" ]]; then
+        local cached_path
+        cached_path=$(cat "$PYTHON_PATH_CACHE")
+        if [[ -x "$cached_path" ]]; then
+            echo "$cached_path"
+            return 0
+        fi
+    fi
+    
+    # Build/fetch the nix environment and cache the python path
+    echo "Setting up Python environment (one-time)..." >&2
+    local python_path
+    python_path=$(nix-shell -p "python3.withPackages(ps: with ps; [ sqlcipher3 pycryptodome ])" --run "which python3" 2>/dev/null)
+    
+    if [[ -x "$python_path" ]]; then
+        echo "$python_path" > "$PYTHON_PATH_CACHE"
+        echo "$python_path"
+        return 0
+    else
+        echo "Failed to set up Python environment" >&2
+        return 1
+    fi
+}
+
+# Get or create the Python path
+PYTHON=$(get_python_path)
+
+# Run the actual script
+exec "$PYTHON" "$PYTHON_SCRIPT" "$@"

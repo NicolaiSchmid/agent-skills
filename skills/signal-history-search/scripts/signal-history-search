@@ -1,0 +1,200 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+signal-history-search — search Signal Desktop history via sigexport (temporary export only)
+
+Usage:
+  signal-history-search list [--filter <pattern>]
+  signal-history-search search --query <pattern> [--chat <name>] [options]
+
+Options:
+  --chat <name>          Limit export to a specific chat name
+  --literal              Treat the query as a literal (fixed string)
+  --case-sensitive       Force case-sensitive search (default smart-case)
+  --before <n>           Show <n> lines of context before each match
+  --after <n>            Show <n> lines of context after each match
+  --context <n>          Show <n> lines of context before and after
+  --max-count <n>        Stop after <n> matches
+  --keep-temp            Skip cleanup of the temporary export (for debugging)
+  -h, --help             Show this help message
+
+Examples:
+  signal-history-search list --filter "monika"
+  signal-history-search search --chat "Dariush Wahdany" --query "invoice"
+EOF
+}
+
+fail() {
+  echo "signal-history-search: $*" >&2
+  exit 1
+}
+
+require_mac() {
+  if [[ "$(uname -s)" != "Darwin" ]]; then
+    fail "Signal Desktop data only available on macOS installs; aborting"
+  fi
+}
+
+require_signal_install() {
+  local data_dir="$HOME/Library/Application Support/Signal"
+  if [[ ! -d "$data_dir" ]]; then
+    fail "Signal Desktop directory not found at $data_dir"
+  fi
+}
+
+require_binary() {
+  command -v "$1" >/dev/null 2>&1 || fail "Missing required command: $1"
+}
+
+run_sigexport() {
+  local cmd="$1"
+  nix-shell -I nixpkgs=channel:nixpkgs-unstable --packages signal-export --command "$cmd"
+}
+
+MODE="search"
+CHAT=""
+QUERY=""
+FILTER=""
+KEEP_TEMP="false"
+RG_OPTS=(--smart-case --color=never --line-number)
+
+if [[ $# -eq 0 ]]; then
+  usage
+  exit 1
+fi
+
+case "$1" in
+  list)
+    MODE="list"
+    shift
+    ;;
+  search)
+    MODE="search"
+    shift
+    ;;
+  -h|--help)
+    usage
+    exit 0
+    ;;
+  *)
+    MODE="search"
+    ;;
+esac
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --chat)
+      [[ $# -lt 2 ]] && fail "--chat requires a value"
+      CHAT="$2"
+      shift 2
+      ;;
+    --query)
+      [[ $# -lt 2 ]] && fail "--query requires a value"
+      QUERY="$2"
+      shift 2
+      ;;
+    --filter)
+      [[ $# -lt 2 ]] && fail "--filter requires a value"
+      FILTER="$2"
+      shift 2
+      ;;
+    --literal)
+      RG_OPTS+=(--fixed-strings)
+      shift
+      ;;
+    --case-sensitive)
+      RG_OPTS+=(--case-sensitive)
+      shift
+      ;;
+    --before)
+      [[ $# -lt 2 ]] && fail "--before requires a value"
+      RG_OPTS+=(--before "$2")
+      shift 2
+      ;;
+    --after)
+      [[ $# -lt 2 ]] && fail "--after requires a value"
+      RG_OPTS+=(--after "$2")
+      shift 2
+      ;;
+    --context)
+      [[ $# -lt 2 ]] && fail "--context requires a value"
+      RG_OPTS+=(--context "$2")
+      shift 2
+      ;;
+    --max-count)
+      [[ $# -lt 2 ]] && fail "--max-count requires a value"
+      RG_OPTS+=(--max-count "$2")
+      shift 2
+      ;;
+    --keep-temp)
+      KEEP_TEMP="true"
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      # treat bare argument as query if unset
+      if [[ -z "$QUERY" ]]; then
+        QUERY="$1"
+      else
+        fail "Unknown argument: $1"
+      fi
+      shift
+      ;;
+  esac
+done
+
+require_mac
+require_signal_install
+require_binary nix-shell
+require_binary rg
+
+if [[ "$MODE" == "list" ]]; then
+  OUTPUT=$(run_sigexport "sigexport --list-chats")
+  if [[ -n "$FILTER" ]]; then
+    echo "$OUTPUT" | rg --smart-case --color=never -- "$FILTER"
+  else
+    echo "$OUTPUT"
+  fi
+  exit 0
+fi
+
+[[ -z "$QUERY" ]] && fail "--query is required for search mode"
+
+EXPORT_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/signal-search.XXXXXX")
+cleanup() {
+  if [[ "$KEEP_TEMP" != "true" ]]; then
+    rm -rf "$EXPORT_ROOT"
+  else
+    echo "Temporary export kept at: $EXPORT_ROOT" >&2
+  fi
+}
+trap cleanup EXIT
+
+EXPORT_DIR="$EXPORT_ROOT/export"
+mkdir -p "$EXPORT_DIR"
+
+CMD="sigexport"
+if [[ -n "$CHAT" ]]; then
+  printf -v CHAT_ESC '%q' "$CHAT"
+  CMD+=" --chats=$CHAT_ESC"
+fi
+printf -v DEST_ESC '%q' "$EXPORT_DIR"
+CMD+=" $DEST_ESC"
+
+echo "Exporting Signal data via sigexport…" >&2
+run_sigexport "$CMD" >/dev/null
+
+if [[ ! -d "$EXPORT_DIR" ]]; then
+  fail "Export directory was not created (expected at $EXPORT_DIR)"
+fi
+
+TARGET_GLOB=("$EXPORT_DIR")
+
+echo "Searching for '$QUERY'…" >&2
+rg "${RG_OPTS[@]}" -- "$QUERY" "${TARGET_GLOB[@]}"

@@ -4,50 +4,19 @@ description: Search documents in Paperless-ngx via REST API. Full-text search, t
 license: MIT
 metadata:
   author: Nicolai Schmid
-  version: 1.0.0
+  version: 2.0.0
   requires:
-    - bash
     - curl
     - jq
-    - Paperless-ngx instance with API access
-scripts:
-  search: ./scripts/paperless-search
 ---
 
 # Paperless Document Search
 
-Search your Paperless-ngx document archive via the REST API. Fast queries with full-text search, filtering by tags/correspondents/dates, and clickable links to view documents in the browser.
-
-## When to use
-
-- You need to find a specific document (invoice, receipt, contract, etc.)
-- You want to search document content (OCR text) without opening the web UI
-- You need to filter documents by tags, correspondents, or date ranges
-- You want quick access to document metadata and direct links
-
-## How it works
-
-1. Authenticates with your Paperless-ngx instance via API token
-2. Sends search queries to the `/api/documents/` endpoint
-3. Returns document metadata, OCR snippets, and clickable URLs
-4. All operations are read-only; nothing is modified
+Search your Paperless-ngx document archive via the REST API.
 
 ## Configuration
 
-Set these environment variables:
-
-```bash
-export PAPERLESS_URL="https://paperless.example.com"
-export PAPERLESS_TOKEN="your-api-token-here"
-```
-
-To get an API token:
-
-1. Log into your Paperless web UI
-2. Click your username (top right) -> "My Profile"
-3. Click the circular arrow button to generate/regenerate a token
-
-Alternatively, create `~/.config/paperless-search/config.json`:
+Config file: `~/.config/paperless-search/config.json`
 
 ```json
 {
@@ -56,120 +25,107 @@ Alternatively, create `~/.config/paperless-search/config.json`:
 }
 ```
 
-Environment variables take precedence over the config file.
+### Getting an API token
 
-## Usage
+1. Log into your Paperless web UI
+2. Click your username (top right) → "My Profile"
+3. Click the circular arrow button to generate/regenerate a token
+
+### Troubleshooting config
+
+If requests fail, verify the config:
 
 ```bash
-# Full-text search across all documents
-paperless-search search --query "invoice january 2025"
+# Check config exists and is valid JSON
+cat ~/.config/paperless-search/config.json | jq .
 
-# Search with tag filter
-paperless-search search --query "payment" --tag "expenses"
+# Test connection
+curl -s -H "Authorization: Token $(jq -r .token ~/.config/paperless-search/config.json)" \
+  "$(jq -r .url ~/.config/paperless-search/config.json)/api/documents/?page_size=1" | jq '.count'
+```
+
+**Common issues:**
+
+- `401 Unauthorized`: Token is invalid/expired → regenerate in web UI
+- `Connection refused`: URL is wrong or server is down
+- `null` or parse error: Config file is missing or malformed
+
+If config is broken, guide the user to provide:
+
+1. Their Paperless-ngx URL (e.g., `https://paperless.example.com`)
+2. A valid API token from their profile page
+
+Then create/update the config:
+
+```bash
+mkdir -p ~/.config/paperless-search
+cat > ~/.config/paperless-search/config.json << 'EOF'
+{
+  "url": "USER_PROVIDED_URL",
+  "token": "USER_PROVIDED_TOKEN"
+}
+EOF
+```
+
+## API Examples
+
+```bash
+# Load config into variables
+PAPERLESS_URL=$(jq -r .url ~/.config/paperless-search/config.json)
+PAPERLESS_TOKEN=$(jq -r .token ~/.config/paperless-search/config.json)
+
+# Full-text search
+curl -s -H "Authorization: Token $PAPERLESS_TOKEN" \
+  "$PAPERLESS_URL/api/documents/?query=invoice+january+2025" | jq '.results[] | {id, title, created}'
+
+# Get document with full OCR content
+curl -s -H "Authorization: Token $PAPERLESS_TOKEN" \
+  "$PAPERLESS_URL/api/documents/123/" | jq -r '.content'
+
+# List correspondents
+curl -s -H "Authorization: Token $PAPERLESS_TOKEN" \
+  "$PAPERLESS_URL/api/correspondents/" | jq '.results[] | {id, name}'
 
 # Filter by correspondent
-paperless-search search --correspondent "ACME Corp"
+curl -s -H "Authorization: Token $PAPERLESS_TOKEN" \
+  "$PAPERLESS_URL/api/documents/?correspondent__id=5" | jq
 
-# Filter by document type
-paperless-search search --type "Invoice"
+# Filter by date range
+curl -s -H "Authorization: Token $PAPERLESS_TOKEN" \
+  "$PAPERLESS_URL/api/documents/?created__date__gte=2024-01-01&created__date__lte=2024-12-31" | jq
 
-# Date range search
-paperless-search search --query "contract" --after "2025-01-01" --before "2025-06-30"
+# List tags
+curl -s -H "Authorization: Token $PAPERLESS_TOKEN" \
+  "$PAPERLESS_URL/api/tags/" | jq '.results[] | {id, name}'
 
-# Combine filters
-paperless-search search --tag "tax" --correspondent "IRS" --after "2024-01-01"
-
-# List all tags
-paperless-search tags
-
-# List all correspondents
-paperless-search correspondents
-
-# List all document types
-paperless-search types
-
-# Get recent documents
-paperless-search recent --limit 20
-
-# Read full metadata and OCR content for a document
-paperless-search read --id 1234
+# List document types
+curl -s -H "Authorization: Token $PAPERLESS_TOKEN" \
+  "$PAPERLESS_URL/api/document_types/" | jq '.results[] | {id, name}'
 ```
 
-### Commands
+## API Reference
 
-| Command          | Description                                    |
-| ---------------- | ---------------------------------------------- |
-| `search`         | Search documents with optional filters         |
-| `tags`           | List all available tags                        |
-| `correspondents` | List all correspondents                        |
-| `types`          | List all document types                        |
-| `recent`         | Get most recent documents                      |
-| `read`           | Show full metadata and OCR text for a document |
+| Endpoint                 | Description                          |
+| ------------------------ | ------------------------------------ |
+| `/api/documents/`        | List/search documents                |
+| `/api/documents/{id}/`   | Get single document with full content |
+| `/api/tags/`             | List all tags                        |
+| `/api/correspondents/`   | List all correspondents              |
+| `/api/document_types/`   | List all document types              |
 
-### Search Flags
+### Query Parameters for `/api/documents/`
 
-| Flag                     | Short | Description                                |
-| ------------------------ | ----- | ------------------------------------------ |
-| `--query <text>`         | `-q`  | Full-text search query                     |
-| `--tag <name>`           | `-t`  | Filter by tag (can be used multiple times) |
-| `--correspondent <name>` | `-c`  | Filter by correspondent                    |
-| `--type <name>`          | `-T`  | Filter by document type                    |
-| `--after <YYYY-MM-DD>`   |       | Documents created after this date          |
-| `--before <YYYY-MM-DD>`  |       | Documents created before this date         |
-| `--limit <n>`            | `-n`  | Maximum results (default: 25)              |
+| Parameter           | Example                            | Description          |
+| ------------------- | ---------------------------------- | -------------------- |
+| `query`             | `query=contract+2022`              | Full-text search     |
+| `correspondent__id` | `correspondent__id=5`              | Filter by correspondent |
+| `tags__id__all`     | `tags__id__all=1,2`                | Must have all tags   |
+| `document_type__id` | `document_type__id=3`              | Filter by type       |
+| `created__date__gte`| `created__date__gte=2024-01-01`    | Created after        |
+| `created__date__lte`| `created__date__lte=2024-12-31`    | Created before       |
+| `ordering`          | `ordering=-created`                | Sort order           |
+| `page_size`         | `page_size=50`                     | Results per page     |
 
-### Output Format
+### Document URL format
 
-```
-[1234] 2025-01-15 | Invoice - ACME Corp - January 2025
-       Correspondent: ACME Corp | Type: Invoice
-       Tags: tax, 2025, expenses
-       https://paperless.example.com/documents/1234/details
-
-[1235] 2025-01-10 | Receipt - Office Supplies
-       Correspondent: Staples | Type: Receipt
-       Tags: expenses, office
-       https://paperless.example.com/documents/1235/details
-```
-
-- First line: Document ID, date, title
-- Second line: Correspondent and document type
-- Third line: Tags
-- Fourth line: Direct link to document in web UI
-
-When using `--query`, search highlights are included:
-
-```
-[1234] 2025-01-15 | Invoice - ACME Corp - January 2025
-       ...payment of <match>$500</match> received for <match>January</match>...
-       https://paperless.example.com/documents/1234/details
-```
-
-## Performance
-
-| Operation                | Time  |
-| ------------------------ | ----- |
-| Full-text search         | <1s   |
-| List tags/correspondents | <0.5s |
-| Read document details    | <0.5s |
-
-## Security Considerations
-
-- API token is stored locally (env var or config file)
-- All requests use HTTPS (assuming your Paperless instance is configured with TLS)
-- Read-only operations; the skill cannot modify documents
-- Nothing is cached or written to disk beyond configuration
-
-## Troubleshooting
-
-- **"Connection refused"**: Check that PAPERLESS_URL is correct and the server is running
-- **"401 Unauthorized"**: Verify your API token is valid (regenerate in web UI if needed)
-- **"No results"**: Try broader search terms; Paperless uses AND for multiple words by default
-- **Slow responses**: Check network connectivity to your Paperless server
-- **Missing documents**: Ensure the API user has permission to view the documents
-
-## Limitations
-
-- Search syntax follows Paperless-ngx conventions (see their docs for advanced queries)
-- Cannot modify, upload, or delete documents (by design)
-- Requires network access to the Paperless instance
+`{PAPERLESS_URL}/documents/{id}/details` - direct link to view in browser

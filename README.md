@@ -1,24 +1,41 @@
-# Agent Inbox Tools
+# Agent Skills
 
-Inbox-centric skills for coding agents. This bundle focuses on searching encrypted or private messages right from the CLI so an agent can answer questions about your communications without manual exporting.
+Skills for coding agents to search private data sources. Each skill provides direct access to encrypted or local databases without manual exporting.
 
 ## Skills
 
-- **`signal-history-search`** — Direct SQL search against Signal Desktop's encrypted database on macOS. Sub-second queries using SQLCipher, no export required.
-- **`apple-mail-search`** — Search Apple Mail via direct SQLite queries. Sub-second search across all configured accounts without launching Mail.app.
+| Skill | Description |
+|-------|-------------|
+| [signal-history-search](./skills/signal-history-search/) | Search Signal Desktop messages via SQLCipher. Sub-second queries on macOS. |
+| [apple-mail-search](./skills/apple-mail-search/) | Search Apple Mail via SQLite. Fast search across all accounts without launching Mail.app. |
+| [paperless-search](./skills/paperless-search/) | Search Paperless-ngx documents via REST API. Full-text search with tag/correspondent filtering. |
 
 ## Installation
 
-```bash
-npx add-skill NicolaiSchmid/agent-inbox-tools
-```
+Copy the desired skill folder to your agent's skills directory, or symlink it.
 
-## Why a dedicated bundle?
+## Structure
 
-1. Messaging data is sensitive. Keeping Signal/Mail workflows together makes it clear which skills require trusted environments.
-2. Future skills (send actions, summarizers, webhook forwards) can share configuration and documentation.
-3. Keeps your main skills repo lean: install inbox tooling only when you need it.
+Each skill contains:
+
+- `SKILL.md` — Full documentation loaded by the agent
+- `README.md` — Quick start for humans
+- `scripts/` — Helper scripts (if any)
+
+## Security
+
+These skills access sensitive data:
+
+- **Signal**: Decrypts local SQLite database using SQLCipher
+- **Apple Mail**: Reads local SQLite mail index
+- **Paperless**: Uses API token for authenticated requests
+
+Only use in trusted environments.
 
 ## Contributing
 
-Pull requests welcome! Please include usage notes, macOS checks, and appropriate security considerations in any new skill scripts.
+Pull requests welcome. Please include:
+
+- Clear usage examples
+- Platform requirements
+- Security considerations

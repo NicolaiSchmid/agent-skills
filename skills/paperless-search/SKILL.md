@@ -128,4 +128,11 @@ curl -s -H "Authorization: Token $PAPERLESS_TOKEN" \
 
 ### Document URL format
 
-`{PAPERLESS_URL}/documents/{id}/details` - direct link to view in browser
+When linking to documents, always use the base URL from the config file:
+
+```bash
+PAPERLESS_URL=$(jq -r .url ~/.config/paperless-search/config.json)
+echo "$PAPERLESS_URL/documents/{id}/details"
+```
+
+Do NOT hardcode or guess the URL - always read it from the config.

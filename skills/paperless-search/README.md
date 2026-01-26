@@ -1,8 +1,10 @@
 # Paperless Document Search
 
-Search documents in Paperless-ngx via REST API.
+Search documents in Paperless-ngx via REST API. Full-text search, tag/correspondent filtering, and direct links to view documents in browser.
 
-Full-text search, tag/correspondent filtering, and direct links to view documents in browser.
+```bash
+npx skills add nicolaischmid/agent-skills/skills/paperless-search
+```
 
 ## Quick Start
 

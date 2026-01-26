@@ -2,6 +2,12 @@
 
 Skills for coding agents to search private data sources. Each skill provides direct access to encrypted or local databases without manual exporting.
 
+## Installation
+
+```bash
+npx skills add nicolaischmid/agent-skills
+```
+
 ## Skills
 
 | Skill | Description |
@@ -9,10 +15,6 @@ Skills for coding agents to search private data sources. Each skill provides dir
 | [signal-history-search](./skills/signal-history-search/) | Search Signal Desktop messages via SQLCipher. Sub-second queries on macOS. |
 | [apple-mail-search](./skills/apple-mail-search/) | Search Apple Mail via SQLite. Fast search across all accounts without launching Mail.app. |
 | [paperless-search](./skills/paperless-search/) | Search Paperless-ngx documents via REST API. Full-text search with tag/correspondent filtering. |
-
-## Installation
-
-Copy the desired skill folder to your agent's skills directory, or symlink it.
 
 ## Structure
 

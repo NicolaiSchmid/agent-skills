@@ -1,8 +1,10 @@
 # Apple Mail Search
 
-Search Apple Mail messages on macOS via direct SQLite queries.
+Search Apple Mail messages on macOS via direct SQLite queries. Sub-second search across all configured mail accounts without launching Mail.app.
 
-Sub-second search across all configured mail accounts without launching Mail.app.
+```bash
+npx skills add nicolaischmid/agent-skills/skills/apple-mail-search
+```
 
 ## Quick Start
 

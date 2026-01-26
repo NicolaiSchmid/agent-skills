@@ -1,8 +1,10 @@
 # Signal History Search
 
-Search Signal Desktop message history on macOS with sub-second query times.
+Search Signal Desktop message history on macOS with sub-second query times. Queries the encrypted SQLite database directly using SQLCipher - no export required.
 
-Queries the encrypted SQLite database directly using SQLCipher - no export required.
+```bash
+npx skills add nicolaischmid/agent-skills/skills/signal-history-search
+```
 
 ## Quick Start
 

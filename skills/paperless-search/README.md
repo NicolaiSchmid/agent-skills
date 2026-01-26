@@ -7,28 +7,24 @@ Full-text search, tag/correspondent filtering, and direct links to view document
 ## Quick Start
 
 ```bash
-# Configure (one-time)
-export PAPERLESS_URL="https://paperless.example.com"
-export PAPERLESS_TOKEN="your-token"
+# Load config
+PAPERLESS_URL=$(jq -r .url ~/.config/paperless-search/config.json)
+PAPERLESS_TOKEN=$(jq -r .token ~/.config/paperless-search/config.json)
 
 # Search documents
-paperless-search search --query "invoice 2025"
+curl -s -H "Authorization: Token $PAPERLESS_TOKEN" \
+  "$PAPERLESS_URL/api/documents/?query=invoice+2025" | jq '.results[] | {id, title}'
 
-# Filter by tag
-paperless-search search --tag "tax"
-
-# List all tags
-paperless-search tags
-
-# Get recent documents
-paperless-search recent --limit 10
+# Get document with full content
+curl -s -H "Authorization: Token $PAPERLESS_TOKEN" \
+  "$PAPERLESS_URL/api/documents/123/" | jq -r '.content'
 ```
 
 ## Requirements
 
-- bash, curl, jq
+- curl, jq
 - Paperless-ngx instance with API access
 
 ## Documentation
 
-See [SKILL.md](./SKILL.md) for full documentation, all commands, and troubleshooting.
+See [SKILL.md](./SKILL.md) for full documentation, API reference, and troubleshooting.

@@ -1,0 +1,576 @@
+#!/usr/bin/env bash
+#
+# paperless-search — Search documents in Paperless-ngx via REST API.
+#
+# Fast search against your Paperless-ngx document archive with full-text search,
+# tag/correspondent filtering, and direct links to view documents.
+#
+# Dependencies: curl, jq
+#
+
+set -euo pipefail
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Configuration
+# ─────────────────────────────────────────────────────────────────────────────
+
+CONFIG_FILE="${HOME}/.config/paperless-search/config.json"
+
+load_config() {
+    local url="${PAPERLESS_URL:-}"
+    local token="${PAPERLESS_TOKEN:-}"
+    
+    # Try config file if env vars not set
+    if [[ -z "$url" || -z "$token" ]] && [[ -f "$CONFIG_FILE" ]]; then
+        if [[ -z "$url" ]]; then
+            url=$(jq -r '.url // empty' "$CONFIG_FILE" 2>/dev/null || true)
+        fi
+        if [[ -z "$token" ]]; then
+            token=$(jq -r '.token // empty' "$CONFIG_FILE" 2>/dev/null || true)
+        fi
+    fi
+    
+    # Validate
+    if [[ -z "$url" ]]; then
+        echo "Error: PAPERLESS_URL not configured" >&2
+        echo "Set PAPERLESS_URL environment variable or create $CONFIG_FILE" >&2
+        exit 1
+    fi
+    
+    if [[ -z "$token" ]]; then
+        echo "Error: PAPERLESS_TOKEN not configured" >&2
+        echo "Set PAPERLESS_TOKEN environment variable or add 'token' to config file" >&2
+        exit 1
+    fi
+    
+    # Remove trailing slash from URL
+    PAPERLESS_URL="${url%/}"
+    PAPERLESS_TOKEN="$token"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# API helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+api_get() {
+    local endpoint="$1"
+    shift
+    local params=("$@")
+    
+    local url="${PAPERLESS_URL}/api/${endpoint}"
+    
+    # Build query string
+    if [[ ${#params[@]} -gt 0 ]]; then
+        local query=""
+        for param in "${params[@]}"; do
+            if [[ -n "$query" ]]; then
+                query="${query}&${param}"
+            else
+                query="$param"
+            fi
+        done
+        url="${url}?${query}"
+    fi
+    
+    local response http_code
+    response=$(curl -s -w "\n%{http_code}" \
+        -H "Authorization: Token ${PAPERLESS_TOKEN}" \
+        -H "Accept: application/json; version=9" \
+        --max-time 30 \
+        "$url" 2>/dev/null) || {
+        echo "Error: Could not connect to ${PAPERLESS_URL}" >&2
+        exit 1
+    }
+    
+    http_code=$(echo "$response" | tail -n1)
+    response=$(echo "$response" | sed '$d')
+    
+    case "$http_code" in
+        200) echo "$response" ;;
+        301|302|303|307|308)
+            echo "Error: Redirect ($http_code) - check PAPERLESS_URL and API token" >&2
+            exit 1 ;;
+        401) echo "Error: Unauthorized - check your API token" >&2; exit 1 ;;
+        403) echo "Error: Forbidden - insufficient permissions" >&2; exit 1 ;;
+        404) echo "Error: Endpoint not found: $endpoint" >&2; exit 1 ;;
+        *)   echo "Error: HTTP $http_code" >&2; exit 1 ;;
+    esac
+}
+
+# Fetch all pages of a paginated endpoint
+api_get_all() {
+    local endpoint="$1"
+    shift
+    local params=("$@")
+    
+    local page=1
+    local all_results="[]"
+    
+    while true; do
+        local page_params=("${params[@]}" "page=$page")
+        local response
+        response=$(api_get "$endpoint" "${page_params[@]}")
+        
+        local results
+        results=$(echo "$response" | jq '.results // []')
+        all_results=$(echo "$all_results" "$results" | jq -s 'add')
+        
+        local has_next
+        has_next=$(echo "$response" | jq -r '.next // empty')
+        if [[ -z "$has_next" ]]; then
+            break
+        fi
+        ((page++))
+    done
+    
+    echo "$all_results"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Formatting helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+format_date() {
+    local date_str="$1"
+    if [[ -z "$date_str" || "$date_str" == "null" ]]; then
+        echo "unknown"
+    else
+        # Extract YYYY-MM-DD from ISO format
+        echo "${date_str:0:10}"
+    fi
+}
+
+strip_html() {
+    local text="$1"
+    # Replace <span class="match"> with <match> markers
+    text=$(echo "$text" | sed -E 's/<span[^>]*class="match"[^>]*>/<match>/g')
+    text=$(echo "$text" | sed 's|</span>|</match>|g')
+    # Remove other HTML tags
+    text=$(echo "$text" | sed -E 's/<[^>]*>//g')
+    echo "$text"
+}
+
+document_url() {
+    local doc_id="$1"
+    echo "${PAPERLESS_URL}/documents/${doc_id}/details"
+}
+
+# Format a single document for display
+format_document() {
+    local doc="$1"
+    local show_highlights="${2:-false}"
+    
+    local doc_id title created correspondent doc_type tags
+    doc_id=$(echo "$doc" | jq -r '.id // "?"')
+    title=$(echo "$doc" | jq -r '.title // "(no title)"')
+    created=$(format_date "$(echo "$doc" | jq -r '.created // empty')")
+    
+    # Get names from nested fields or direct fields
+    correspondent=$(echo "$doc" | jq -r '.correspondent__name // .correspondent_name // empty')
+    doc_type=$(echo "$doc" | jq -r '.document_type__name // .document_type_name // empty')
+    tags=$(echo "$doc" | jq -r '(.tags__name // .tag_names // []) | if type == "array" then join(", ") else . end')
+    
+    # First line: ID, date, title
+    echo "[$doc_id] $created | $title"
+    
+    # Correspondent and type line
+    local meta_parts=""
+    if [[ -n "$correspondent" ]]; then
+        meta_parts="Correspondent: $correspondent"
+    fi
+    if [[ -n "$doc_type" ]]; then
+        if [[ -n "$meta_parts" ]]; then
+            meta_parts="$meta_parts | Type: $doc_type"
+        else
+            meta_parts="Type: $doc_type"
+        fi
+    fi
+    if [[ -n "$meta_parts" ]]; then
+        echo "       $meta_parts"
+    fi
+    
+    # Tags line
+    if [[ -n "$tags" ]]; then
+        echo "       Tags: $tags"
+    fi
+    
+    # Search highlights
+    if [[ "$show_highlights" == "true" ]]; then
+        local highlights
+        highlights=$(echo "$doc" | jq -r '.__search_hit__.highlights // empty')
+        if [[ -n "$highlights" ]]; then
+            highlights=$(strip_html "$highlights")
+            echo "       ...$highlights..."
+        fi
+    fi
+    
+    # Document URL
+    echo "       $(document_url "$doc_id")"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Commands
+# ─────────────────────────────────────────────────────────────────────────────
+
+cmd_search() {
+    local query="" tags=() correspondent="" doc_type="" after="" before="" limit=25
+    
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -q|--query) query="$2"; shift 2 ;;
+            -t|--tag) tags+=("$2"); shift 2 ;;
+            -c|--correspondent) correspondent="$2"; shift 2 ;;
+            -T|--type) doc_type="$2"; shift 2 ;;
+            --after) after="$2"; shift 2 ;;
+            --before) before="$2"; shift 2 ;;
+            -n|--limit) limit="$2"; shift 2 ;;
+            *) echo "Unknown option: $1" >&2; exit 1 ;;
+        esac
+    done
+    
+    local params=("page_size=$limit" "ordering=-created")
+    
+    # Full-text query
+    if [[ -n "$query" ]]; then
+        params+=("query=$(printf '%s' "$query" | jq -sRr @uri)")
+    fi
+    
+    # Tag filter - need to look up tag IDs
+    if [[ ${#tags[@]} -gt 0 ]]; then
+        local all_tags tag_ids=""
+        all_tags=$(api_get_all "tags/")
+        
+        for tag_name in "${tags[@]}"; do
+            local tag_id
+            tag_id=$(echo "$all_tags" | jq -r --arg name "$tag_name" \
+                '.[] | select(.name | ascii_downcase == ($name | ascii_downcase)) | .id' | head -1)
+            if [[ -n "$tag_id" ]]; then
+                if [[ -n "$tag_ids" ]]; then
+                    tag_ids="${tag_ids},${tag_id}"
+                else
+                    tag_ids="$tag_id"
+                fi
+            else
+                echo "Warning: Tag '$tag_name' not found" >&2
+            fi
+        done
+        
+        if [[ -n "$tag_ids" ]]; then
+            params+=("tags__id__all=$tag_ids")
+        fi
+    fi
+    
+    # Correspondent filter
+    if [[ -n "$correspondent" ]]; then
+        local all_correspondents corr_id
+        all_correspondents=$(api_get_all "correspondents/")
+        corr_id=$(echo "$all_correspondents" | jq -r --arg name "$correspondent" \
+            '.[] | select(.name | ascii_downcase | contains($name | ascii_downcase)) | .id' | head -1)
+        if [[ -n "$corr_id" ]]; then
+            params+=("correspondent__id=$corr_id")
+        else
+            echo "Warning: Correspondent '$correspondent' not found" >&2
+        fi
+    fi
+    
+    # Document type filter
+    if [[ -n "$doc_type" ]]; then
+        local all_types type_id
+        all_types=$(api_get_all "document_types/")
+        type_id=$(echo "$all_types" | jq -r --arg name "$doc_type" \
+            '.[] | select(.name | ascii_downcase | contains($name | ascii_downcase)) | .id' | head -1)
+        if [[ -n "$type_id" ]]; then
+            params+=("document_type__id=$type_id")
+        else
+            echo "Warning: Document type '$doc_type' not found" >&2
+        fi
+    fi
+    
+    # Date filters
+    if [[ -n "$after" ]]; then
+        params+=("created__date__gte=$after")
+    fi
+    if [[ -n "$before" ]]; then
+        params+=("created__date__lte=$before")
+    fi
+    
+    # Execute search
+    local response count results
+    response=$(api_get "documents/" "${params[@]}")
+    count=$(echo "$response" | jq -r '.count // 0')
+    results=$(echo "$response" | jq -c '.results // []')
+    
+    local num_results
+    num_results=$(echo "$results" | jq 'length')
+    
+    if [[ "$num_results" -eq 0 ]]; then
+        echo "No documents found" >&2
+        return
+    fi
+    
+    local show_highlights="false"
+    [[ -n "$query" ]] && show_highlights="true"
+    
+    echo "$results" | jq -c '.[]' | while read -r doc; do
+        format_document "$doc" "$show_highlights"
+        echo
+    done
+    
+    if [[ "$count" -gt "$num_results" ]]; then
+        echo "-- Showing $num_results of $count documents (use --limit to see more) --" >&2
+    else
+        echo "-- $count document(s) found --" >&2
+    fi
+}
+
+cmd_tags() {
+    local tags
+    tags=$(api_get_all "tags/")
+    
+    local count
+    count=$(echo "$tags" | jq 'length')
+    
+    if [[ "$count" -eq 0 ]]; then
+        echo "No tags found"
+        return
+    fi
+    
+    echo "Tags:"
+    echo "$tags" | jq -r 'sort_by(.name | ascii_downcase) | .[] | "  - \(.name) (\(.document_count // 0) docs)"'
+}
+
+cmd_correspondents() {
+    local correspondents
+    correspondents=$(api_get_all "correspondents/")
+    
+    local count
+    count=$(echo "$correspondents" | jq 'length')
+    
+    if [[ "$count" -eq 0 ]]; then
+        echo "No correspondents found"
+        return
+    fi
+    
+    echo "Correspondents:"
+    echo "$correspondents" | jq -r 'sort_by(.name | ascii_downcase) | .[] | "  - \(.name) (\(.document_count // 0) docs)"'
+}
+
+cmd_types() {
+    local types
+    types=$(api_get_all "document_types/")
+    
+    local count
+    count=$(echo "$types" | jq 'length')
+    
+    if [[ "$count" -eq 0 ]]; then
+        echo "No document types found"
+        return
+    fi
+    
+    echo "Document Types:"
+    echo "$types" | jq -r 'sort_by(.name | ascii_downcase) | .[] | "  - \(.name) (\(.document_count // 0) docs)"'
+}
+
+cmd_recent() {
+    local limit=20
+    
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -n|--limit) limit="$2"; shift 2 ;;
+            *) echo "Unknown option: $1" >&2; exit 1 ;;
+        esac
+    done
+    
+    local params=("page_size=$limit" "ordering=-added")
+    local response results
+    response=$(api_get "documents/" "${params[@]}")
+    results=$(echo "$response" | jq -c '.results // []')
+    
+    local num_results
+    num_results=$(echo "$results" | jq 'length')
+    
+    if [[ "$num_results" -eq 0 ]]; then
+        echo "No documents found"
+        return
+    fi
+    
+    echo "$results" | jq -c '.[]' | while read -r doc; do
+        format_document "$doc" "false"
+        echo
+    done
+    
+    echo "-- $num_results most recent document(s) --" >&2
+}
+
+cmd_read() {
+    local doc_id=""
+    
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --id) doc_id="$2"; shift 2 ;;
+            *) echo "Unknown option: $1" >&2; exit 1 ;;
+        esac
+    done
+    
+    if [[ -z "$doc_id" ]]; then
+        echo "Error: --id is required" >&2
+        exit 1
+    fi
+    
+    local doc
+    doc=$(api_get "documents/${doc_id}/")
+    
+    echo "Document ID: $(echo "$doc" | jq -r '.id')"
+    echo "Title: $(echo "$doc" | jq -r '.title // "(no title)"')"
+    echo "Created: $(format_date "$(echo "$doc" | jq -r '.created // empty')")"
+    echo "Added: $(format_date "$(echo "$doc" | jq -r '.added // empty')")"
+    echo "Modified: $(format_date "$(echo "$doc" | jq -r '.modified // empty')")"
+    
+    # Fetch correspondent name
+    local corr_id
+    corr_id=$(echo "$doc" | jq -r '.correspondent // empty')
+    if [[ -n "$corr_id" ]]; then
+        local corr
+        corr=$(api_get "correspondents/${corr_id}/")
+        echo "Correspondent: $(echo "$corr" | jq -r '.name // "Unknown"')"
+    fi
+    
+    # Fetch document type name
+    local type_id
+    type_id=$(echo "$doc" | jq -r '.document_type // empty')
+    if [[ -n "$type_id" ]]; then
+        local dtype
+        dtype=$(api_get "document_types/${type_id}/")
+        echo "Document Type: $(echo "$dtype" | jq -r '.name // "Unknown"')"
+    fi
+    
+    # Fetch tag names
+    local tag_ids
+    tag_ids=$(echo "$doc" | jq -r '.tags // [] | .[]')
+    if [[ -n "$tag_ids" ]]; then
+        local tag_names=""
+        for tag_id in $tag_ids; do
+            local tag
+            tag=$(api_get "tags/${tag_id}/")
+            local tag_name
+            tag_name=$(echo "$tag" | jq -r '.name // empty')
+            if [[ -n "$tag_names" ]]; then
+                tag_names="${tag_names}, ${tag_name}"
+            else
+                tag_names="$tag_name"
+            fi
+        done
+        echo "Tags: $tag_names"
+    fi
+    
+    local asn
+    asn=$(echo "$doc" | jq -r '.archive_serial_number // empty')
+    if [[ -n "$asn" ]]; then
+        echo "ASN: $asn"
+    fi
+    
+    echo "URL: $(document_url "$doc_id")"
+    echo
+    echo "------------------------------------------------------------"
+    echo "CONTENT:"
+    echo "------------------------------------------------------------"
+    
+    local content
+    content=$(echo "$doc" | jq -r '.content // empty')
+    if [[ -n "$content" ]]; then
+        local content_len=${#content}
+        if [[ $content_len -gt 10000 ]]; then
+            echo "${content:0:10000}"
+            echo
+            echo "... (truncated, $content_len total characters)"
+        else
+            echo "$content"
+        fi
+    else
+        echo "(no OCR content available)"
+    fi
+}
+
+usage() {
+    cat <<EOF
+Usage: paperless-search <command> [options]
+
+Commands:
+  search          Search documents with filters
+  tags            List all tags
+  correspondents  List all correspondents
+  types           List all document types
+  recent          Get most recent documents
+  read            Read document details and content
+
+Search options:
+  -q, --query <text>       Full-text search query
+  -t, --tag <name>         Filter by tag (can repeat)
+  -c, --correspondent <n>  Filter by correspondent
+  -T, --type <name>        Filter by document type
+  --after <YYYY-MM-DD>     Documents created after date
+  --before <YYYY-MM-DD>    Documents created before date
+  -n, --limit <n>          Max results (default: 25)
+
+Recent options:
+  -n, --limit <n>          Max results (default: 20)
+
+Read options:
+  --id <id>                Document ID (required)
+
+Configuration:
+  Set PAPERLESS_URL and PAPERLESS_TOKEN environment variables,
+  or create ~/.config/paperless-search/config.json:
+  {
+    "url": "https://paperless.example.com",
+    "token": "your-api-token"
+  }
+
+Examples:
+  paperless-search search --query "invoice 2025"
+  paperless-search search --tag "tax" --correspondent "IRS"
+  paperless-search recent --limit 10
+  paperless-search read --id 1234
+EOF
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────────────
+
+main() {
+    # Check dependencies
+    if ! command -v curl &>/dev/null; then
+        echo "Error: curl is required" >&2
+        exit 1
+    fi
+    if ! command -v jq &>/dev/null; then
+        echo "Error: jq is required" >&2
+        exit 1
+    fi
+    
+    if [[ $# -eq 0 ]]; then
+        usage
+        exit 1
+    fi
+    
+    local command="$1"
+    shift
+    
+    case "$command" in
+        search|tags|correspondents|types|recent|read)
+            load_config
+            "cmd_${command}" "$@"
+            ;;
+        -h|--help|help)
+            usage
+            ;;
+        *)
+            echo "Unknown command: $command" >&2
+            echo "Run 'paperless-search --help' for usage" >&2
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
